@@ -38,6 +38,7 @@ from frostcore.contracts.probe import (
 )
 from frostcore.contracts.turn import (
     FocusDelta,
+    FocusExitRecord,
     PersistDecision,
     TurnInput,
     TurnOutcome,
@@ -57,6 +58,7 @@ __all__ = [
     "EntityRef",
     "EventSink",
     "FocusDelta",
+    "FocusExitRecord",
     "HealthReporter",
     "HistoryStore",
     "InboundEvent",

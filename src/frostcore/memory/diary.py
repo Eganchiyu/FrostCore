@@ -28,6 +28,7 @@ class DiaryEngine:
         lock_for_chat: Callable[[str], asyncio.Lock],
         *,
         is_chat_focused: Callable[[str], bool] | None = None,
+        can_trigger_diary: Callable[[str], bool] | None = None,
         min_dialogue_turns: int = 12,
         keep_last_turns: int = 10,
         event_sink: EventSink | None = None,
@@ -37,6 +38,7 @@ class DiaryEngine:
         self.summarizer = summarizer
         self._lock_for_chat = lock_for_chat
         self._is_chat_focused = is_chat_focused or (lambda _cid: False)
+        self._can_trigger_diary = can_trigger_diary or (lambda _cid: True)
         self.min_dialogue_turns = max(1, min_dialogue_turns)
         self.keep_last_turns = max(0, keep_last_turns)
         self._event_sink = event_sink
@@ -54,6 +56,9 @@ class DiaryEngine:
 
     async def consolidate(self, chat_id: str, *, force: bool = False) -> str | None:
         cid = str(chat_id)
+        if not self._can_trigger_diary(cid):
+            self._emit("mode.capability_denied", cid, {"capability": "triggers_diary"})
+            return None
         chat_lock = self._lock_for_chat(cid)
 
         # Phase 1: short lock to snapshot pure dialogue and watermark_seq

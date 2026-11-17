@@ -1,4 +1,4 @@
-"""Deterministic turn evaluation function F(TurnInput) -> TurnOutput."""
+"""Pure deterministic turn evaluation function F(TurnInput) -> TurnOutput."""
 from __future__ import annotations
 
 import copy
@@ -12,14 +12,13 @@ from typing import Any
 
 from frostcore.contracts.ports import HistoryStore, LLMClient, LLMRequest, LLMResponse
 from frostcore.contracts.probe import EventSink, StructuredEvent
-from frostcore.contracts.turn import FocusDelta, TurnInput, TurnOutput
+from frostcore.contracts.turn import FocusDelta, FocusExitRecord, TurnInput, TurnOutput
 from frostcore.focus.manager import FocusManager
 from frostcore.focus.view import ToolView
 from frostcore.kernel.hooks import (
     EventTraceHook,
     FocusHook,
     FocusTraceHook,
-    PruneHook,
     TurnHook,
     TurnHookChain,
     TurnState,
@@ -31,6 +30,7 @@ from frostcore.kernel.toolchain import (
     ToolCallManager,
     ToolContext,
 )
+from frostcore.observability.text import safe_truncate
 
 _TEXT_TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
@@ -74,7 +74,7 @@ def extract_text_tool_calls(
 
 
 class TurnEvaluator:
-    """Implements F(TurnInput) -> TurnOutput with deterministic seed/time isolation."""
+    """Implements pure F(TurnInput) -> TurnOutput without HistoryStore write side effects."""
 
     def __init__(
         self,
@@ -116,13 +116,11 @@ class TurnEvaluator:
     def _build_hooks(self, turn_input: TurnInput) -> tuple[TurnHookChain, FocusHook]:
         focus_hook = FocusHook(
             self.focus_manager,
-            self.history,
+            None,
             restore_rounds_on_exit=self.restore_rounds_on_exit,
             gate_exited_writes=self.gate_exited_writes,
         )
         hooks: list[TurnHook] = [focus_hook]
-        if self.pruner is not None:
-            hooks.append(PruneHook(self.pruner, self.focus_manager))
         incoming_text = "\n".join(getattr(ev, "content", "") for ev in turn_input.events).strip()
         hooks.append(FocusTraceHook(self.focus_manager, incoming_text=incoming_text))
         if self.event_sink is not None:
@@ -152,7 +150,7 @@ class TurnEvaluator:
         return data if isinstance(data, dict) else {}
 
     async def evaluate(self, turn_input: TurnInput) -> TurnOutput:
-        """Linear deterministic turn evaluation F(TurnInput) -> TurnOutput."""
+        """Pure linear deterministic turn evaluation F(TurnInput) -> TurnOutput."""
         tool_messages = self._build_initial_messages(turn_input)
         initial_len = len(tool_messages)
         tool_manager = ToolCallManager(
@@ -166,6 +164,7 @@ class TurnEvaluator:
             focus_manager=self.focus_manager,
             seed=self.seed,
             extra=dict(turn_input.extra),
+            metadata={"defer_history_persist": True},
         )
         st = TurnState(
             chat_id=str(turn_input.chat_id),
@@ -183,6 +182,7 @@ class TurnEvaluator:
 
         hooks.on_turn_start(st)
         try:
+            finished_early = False
             while st.round_idx < st.max_rounds:
                 st.round_idx += 1
                 hooks.before_llm(st)
@@ -225,11 +225,12 @@ class TurnEvaluator:
                         {
                             "round": st.round_idx,
                             "llm_ms": llm_ms,
-                            "thought": content[:240],
+                            "thought": safe_truncate(content, 240),
                             "calls": [],
                         }
                     )
-                    return self._build_output(st, initial_len)
+                    finished_early = True
+                    break
 
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
@@ -252,7 +253,7 @@ class TurnEvaluator:
                         st.pending_thought = content.strip()
 
                 if st.pending_thought and not focus_hook.gate_exited_writes:
-                    self._persist_thought(st, hooks)
+                    self._buffer_thought(st, hooks)
 
                 st.tool_messages.append(assistant_msg)
                 t_exec = time.monotonic()
@@ -268,11 +269,14 @@ class TurnEvaluator:
                         "round": st.round_idx,
                         "llm_ms": llm_ms,
                         "exec_ms": exec_ms,
-                        "thought": content[:240],
+                        "thought": safe_truncate(content, 240),
                         "calls": [
                             {
                                 "name": str((c.get("function") or {}).get("name") or ""),
-                                "args": str((c.get("function") or {}).get("arguments") or "")[:200],
+                                "args": safe_truncate(
+                                    str((c.get("function") or {}).get("arguments") or ""),
+                                    200,
+                                ),
                             }
                             for c in calls
                         ],
@@ -282,41 +286,45 @@ class TurnEvaluator:
                 if st.context.metadata.get("skip_reply"):
                     st.outcome = "skip"
                     st.final = (SKIP_REPLY_SENTINEL, SKIP_REPLY_SENTINEL)
-                    return self._build_output(st, initial_len)
+                    st.persist_messages.clear()
+                    st.completed_exits.clear()
+                    finished_early = True
+                    break
 
                 focus_hook.collect_batch_exits(st)
                 if st.pending_thought:
-                    self._persist_thought(st, hooks)
+                    self._buffer_thought(st, hooks)
 
-                self._persist_tool_results(st, hooks, results)
+                self._buffer_tool_results(st, hooks, results)
                 st.tool_messages.extend(results)
                 hooks.after_batch(st, results)
 
-            # Max rounds exhausted -> force plain text closing turn
-            closing_messages = copy.deepcopy(st.tool_messages) + [
-                {
-                    "role": "user",
-                    "content": (
-                        "Tool call budget exhausted for this turn. "
-                        "Provide a direct text reply without calling any more tools."
-                    ),
-                }
-            ]
-            closing_resp: LLMResponse = await self.llm.complete(
-                LLMRequest(
-                    messages=closing_messages,
-                    tools=[],
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    max_tokens=self.max_tokens,
+            if not finished_early:
+                closing_messages = copy.deepcopy(st.tool_messages) + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Tool call budget exhausted for this turn. "
+                            "Provide a direct text reply without calling any more tools."
+                        ),
+                    }
+                ]
+                closing_resp: LLMResponse = await self.llm.complete(
+                    LLMRequest(
+                        messages=closing_messages,
+                        tools=[],
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        max_tokens=self.max_tokens,
+                    )
                 )
-            )
-            st.outcome = "exhausted"
-            st.final = (closing_resp.content, closing_resp.content)
-            return self._build_output(st, initial_len)
+                st.outcome = "exhausted"
+                st.final = (closing_resp.content, closing_resp.content)
         except Exception as exc:
             st.outcome = "error"
             st.final = ("", "")
+            st.persist_messages.clear()
+            st.completed_exits.clear()
             st.tool_trace.append({"round": st.round_idx, "error": str(exc)})
             if self.event_sink is not None:
                 self.event_sink.emit(
@@ -327,33 +335,36 @@ class TurnEvaluator:
                         payload={"error": str(exc), "round": st.round_idx},
                     )
                 )
-            return self._build_output(st, initial_len)
         finally:
             hooks.on_turn_end(st)
 
-    def _persist_thought(self, st: TurnState, hooks: TurnHookChain) -> None:
+        return self._build_output(st, initial_len)
+
+    def _buffer_thought(self, st: TurnState, hooks: TurnHookChain) -> None:
         thought = st.pending_thought
         st.pending_thought = ""
-        if self.history is None or not thought:
+        if not thought:
             return
         decision = hooks.classify_persist(
             st, {"role": "assistant", "content": thought, "is_tool_thought": True}
         )
         if decision.action == "drop":
             return
-        extra: dict[str, Any] = {"is_tool_thought": True}
+        msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": thought,
+            "is_tool_thought": True,
+        }
         if decision.focus_work:
-            extra["focus_work"] = decision.focus_work
-        self.history.append_message(st.chat_id, "assistant", thought, **extra)
+            msg["focus_work"] = decision.focus_work
+        st.persist_messages.append(msg)
 
-    def _persist_tool_results(
+    def _buffer_tool_results(
         self,
         st: TurnState,
         hooks: TurnHookChain,
         results: list[dict[str, Any]],
     ) -> None:
-        if self.history is None:
-            return
         for msg in results:
             tool_name = str(msg.get("name") or "")
             spec = st.active_registry.get_spec(tool_name)
@@ -365,21 +376,34 @@ class TurnEvaluator:
             decision = hooks.classify_persist(st, msg)
             if decision.action == "drop":
                 continue
-            extra: dict[str, Any] = {
+            entry: dict[str, Any] = {
+                "role": "tool",
+                "content": msg.get("content"),
                 "name": tool_name,
                 "tool_call_id": msg.get("tool_call_id"),
             }
             if decision.focus_work:
-                extra["focus_work"] = decision.focus_work
-            self.history.append_message(st.chat_id, "tool", msg.get("content"), **extra)
+                entry["focus_work"] = decision.focus_work
+            st.persist_messages.append(entry)
 
     def _build_output(self, st: TurnState, initial_len: int) -> TurnOutput:
         raw_reply, reply = st.final if st.final is not None else ("", "")
         active_after = self.focus_manager.active(st.chat_id)
+        exits = tuple(
+            FocusExitRecord(
+                chat_id=e.chat_id,
+                domain=e.domain,
+                summary=e.summary,
+                reason=e.reason,
+            )
+            for e in st.completed_exits
+        )
         return TurnOutput(
             reply=reply,
             raw_reply=raw_reply,
             turn_messages=copy.deepcopy(st.tool_messages[initial_len:]),
+            persist_messages=copy.deepcopy(st.persist_messages),
+            focus_exits=exits,
             tool_trace=copy.deepcopy(st.tool_trace),
             focus_delta=FocusDelta(
                 entered=st.entered_domains[-1] if st.entered_domains else None,

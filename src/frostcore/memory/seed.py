@@ -205,6 +205,15 @@ class FrostSeed:
                 last_active_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                chat_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                active_focus_domain TEXT,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_focus
+                ON chat_sessions(active_focus_domain)
+                WHERE active_focus_domain IS NOT NULL;
             """
         )
 
@@ -443,16 +452,15 @@ class FrostSeed:
             metadata=dict(json.loads(row["metadata_json"] or "{}")),
         )
 
-    # ------------------------------------------------------------ Entities & Notes & Rhythm
-    def upsert_entity(
+    # ------------------------------------------------------------ Entities, Notes & Rhythm
+    def _build_upsert_entity_op(
         self,
         entity_id: str,
         display_name: str,
-        *,
-        aliases: Sequence[str] = (),
-        impression: str = "",
-        affinity: float = 0.0,
-    ) -> None:
+        aliases: Sequence[str],
+        impression: str,
+        affinity: float,
+    ) -> Callable[[], None]:
         now = time.time()
         aliases_json = json.dumps(list(dict.fromkeys(aliases)), ensure_ascii=False)
 
@@ -474,9 +482,35 @@ class FrostSeed:
             )
             conn.commit()
 
-        self._call_sync(_op)
+        return _op
 
-    def get_entity(self, entity_id: str) -> EntityRecord | None:
+    def upsert_entity(
+        self,
+        entity_id: str,
+        display_name: str,
+        *,
+        aliases: Sequence[str] = (),
+        impression: str = "",
+        affinity: float = 0.0,
+    ) -> None:
+        self._call_sync(
+            self._build_upsert_entity_op(entity_id, display_name, aliases, impression, affinity)
+        )
+
+    async def a_upsert_entity(
+        self,
+        entity_id: str,
+        display_name: str,
+        *,
+        aliases: Sequence[str] = (),
+        impression: str = "",
+        affinity: float = 0.0,
+    ) -> None:
+        await self._call_async(
+            self._build_upsert_entity_op(entity_id, display_name, aliases, impression, affinity)
+        )
+
+    def _build_get_entity_op(self, entity_id: str) -> Callable[[], EntityRecord | None]:
         def _op() -> EntityRecord | None:
             conn = self._connect()
             row = conn.execute(
@@ -494,9 +528,15 @@ class FrostSeed:
                 updated_at=float(row["updated_at"]),
             )
 
-        return self._call_sync(_op)
+        return _op
 
-    def set_note(self, key: str, content: str) -> None:
+    def get_entity(self, entity_id: str) -> EntityRecord | None:
+        return self._call_sync(self._build_get_entity_op(entity_id))
+
+    async def a_get_entity(self, entity_id: str) -> EntityRecord | None:
+        return await self._call_async(self._build_get_entity_op(entity_id))
+
+    def _build_set_note_op(self, key: str, content: str) -> Callable[[], None]:
         now = time.time()
 
         def _op() -> None:
@@ -512,9 +552,15 @@ class FrostSeed:
             )
             conn.commit()
 
-        self._call_sync(_op)
+        return _op
 
-    def get_note(self, key: str) -> str | None:
+    def set_note(self, key: str, content: str) -> None:
+        self._call_sync(self._build_set_note_op(key, content))
+
+    async def a_set_note(self, key: str, content: str) -> None:
+        await self._call_async(self._build_set_note_op(key, content))
+
+    def _build_get_note_op(self, key: str) -> Callable[[], str | None]:
         def _op() -> str | None:
             conn = self._connect()
             row = conn.execute(
@@ -523,7 +569,13 @@ class FrostSeed:
             ).fetchone()
             return str(row["content"]) if row is not None else None
 
-        return self._call_sync(_op)
+        return _op
+
+    def get_note(self, key: str) -> str | None:
+        return self._call_sync(self._build_get_note_op(key))
+
+    async def a_get_note(self, key: str) -> str | None:
+        return await self._call_async(self._build_get_note_op(key))
 
     def set_meta(self, key: str, value: str) -> None:
         now = time.time()
@@ -554,15 +606,14 @@ class FrostSeed:
 
         return self._call_sync(_op)
 
-    def save_rhythm_snapshot(
+    def _build_save_rhythm_op(
         self,
         chat_id: str,
-        *,
         energy: float,
         activity: float,
         desire: float,
         last_active_at: float,
-    ) -> None:
+    ) -> Callable[[], None]:
         now = time.time()
 
         def _op() -> None:
@@ -583,9 +634,35 @@ class FrostSeed:
             )
             conn.commit()
 
-        self._call_sync(_op)
+        return _op
 
-    def load_rhythm_snapshot(self, chat_id: str) -> RhythmSnapshot | None:
+    def save_rhythm_snapshot(
+        self,
+        chat_id: str,
+        *,
+        energy: float,
+        activity: float,
+        desire: float,
+        last_active_at: float,
+    ) -> None:
+        self._call_sync(
+            self._build_save_rhythm_op(chat_id, energy, activity, desire, last_active_at)
+        )
+
+    async def a_save_rhythm_snapshot(
+        self,
+        chat_id: str,
+        *,
+        energy: float,
+        activity: float,
+        desire: float,
+        last_active_at: float,
+    ) -> None:
+        await self._call_async(
+            self._build_save_rhythm_op(chat_id, energy, activity, desire, last_active_at)
+        )
+
+    def _build_load_rhythm_op(self, chat_id: str) -> Callable[[], RhythmSnapshot | None]:
         def _op() -> RhythmSnapshot | None:
             conn = self._connect()
             row = conn.execute(
@@ -603,7 +680,80 @@ class FrostSeed:
                 updated_at=float(row["updated_at"]),
             )
 
-        return self._call_sync(_op)
+        return _op
+
+    def load_rhythm_snapshot(self, chat_id: str) -> RhythmSnapshot | None:
+        return self._call_sync(self._build_load_rhythm_op(chat_id))
+
+    async def a_load_rhythm_snapshot(self, chat_id: str) -> RhythmSnapshot | None:
+        return await self._call_async(self._build_load_rhythm_op(chat_id))
+
+    def _build_set_chat_focus_op(
+        self,
+        chat_id: str,
+        filename: str,
+        active_focus_domain: str | None,
+    ) -> Callable[[], None]:
+        now = time.time()
+
+        def _op() -> None:
+            conn = self._connect()
+            conn.execute(
+                """
+                INSERT INTO chat_sessions (chat_id, filename, active_focus_domain, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    filename = excluded.filename,
+                    active_focus_domain = excluded.active_focus_domain,
+                    updated_at = excluded.updated_at
+                """,
+                (str(chat_id), filename, active_focus_domain, now),
+            )
+            conn.commit()
+
+        return _op
+
+    def set_chat_focus_domain(
+        self,
+        chat_id: str,
+        active_focus_domain: str | None,
+        *,
+        filename: str = "",
+    ) -> None:
+        from frostcore.memory.history import safe_chat_filename
+
+        fname = filename or safe_chat_filename(chat_id)
+        self._call_sync(self._build_set_chat_focus_op(chat_id, fname, active_focus_domain))
+
+    async def a_set_chat_focus_domain(
+        self,
+        chat_id: str,
+        active_focus_domain: str | None,
+        *,
+        filename: str = "",
+    ) -> None:
+        from frostcore.memory.history import safe_chat_filename
+
+        fname = filename or safe_chat_filename(chat_id)
+        await self._call_async(
+            self._build_set_chat_focus_op(chat_id, fname, active_focus_domain)
+        )
+
+    def _build_list_active_focus_op(self) -> Callable[[], list[str]]:
+        def _op() -> list[str]:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT chat_id FROM chat_sessions WHERE active_focus_domain IS NOT NULL"
+            ).fetchall()
+            return [str(r["chat_id"]) for r in rows]
+
+        return _op
+
+    def list_active_focus_chats(self) -> list[str]:
+        return self._call_sync(self._build_list_active_focus_op())
+
+    async def a_list_active_focus_chats(self) -> list[str]:
+        return await self._call_async(self._build_list_active_focus_op())
 
     def close(self) -> None:
         if self._closed:

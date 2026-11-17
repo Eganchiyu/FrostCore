@@ -71,6 +71,7 @@ class ToolSpec:
     parameters: dict[str, Any]
     handler: Callable[..., Awaitable[ToolResult]]
     persist_result: bool = True
+    concurrent_safe: bool = False
 
     def to_schema(self) -> dict[str, Any]:
         return {
@@ -208,6 +209,28 @@ class ToolCallManager:
         finish_reason: str = "",
         view: Any = None,
     ) -> list[dict[str, Any]]:
+        if len(tool_calls) > 1:
+            all_safe = all(
+                (spec := self.registry.get_spec(str((c.get("function") or {}).get("name") or "")))
+                is not None
+                and spec.concurrent_safe
+                for c in tool_calls
+            )
+            if all_safe:
+                return list(
+                    await asyncio.gather(
+                        *(
+                            self.execute_tool_call(
+                                call,
+                                context,
+                                finish_reason=finish_reason,
+                                view=view,
+                            )
+                            for call in tool_calls
+                        )
+                    )
+                )
+
         results: list[dict[str, Any]] = []
         for call in tool_calls:
             results.append(

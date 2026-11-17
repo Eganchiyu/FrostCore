@@ -13,6 +13,7 @@ from frostcore.contracts import (
     EntityRef,
     EventSink,
     FocusDelta,
+    FocusExitRecord,
     HealthReporter,
     HistoryStore,
     InboundEvent,
@@ -39,6 +40,7 @@ from frostcore.contracts import (
 from frostcore.focus import (
     FocusDomain,
     FocusExit,
+    FocusForbiddenError,
     FocusManager,
     FocusState,
     ToolView,
@@ -89,6 +91,7 @@ from frostcore.observability import (
     PersonaTamperedError,
     ReadOnlyPersonaSnapshot,
     is_dry_run,
+    safe_truncate,
 )
 from frostcore.rhythm import (
     ConstantClock,
@@ -125,6 +128,8 @@ __all__ = [
     "FocusDelta",
     "FocusDomain",
     "FocusExit",
+    "FocusExitRecord",
+    "FocusForbiddenError",
     "FocusManager",
     "FocusState",
     "FrostApp",
@@ -190,4 +195,5 @@ __all__ = [
     "focus_finish_spec",
     "focus_start_spec",
     "is_dry_run",
+    "safe_truncate",
 ]

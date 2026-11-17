@@ -80,16 +80,21 @@ class FrostApp:
         self.health_probe = health_probe
         self.persona_guard = persona_guard
         self.close_seed_on_stop = close_seed_on_stop
+        self._bg_index_tasks: set[asyncio.Task[Any]] = set()
 
-        self.focus_manager = FocusManager()
-        for domain in focus_domains:
-            self.focus_manager.register(domain)
-
-        self.registry = FunctionRegistry(list(tools))
         self.mode_router = ModeRouter(event_sink=self.event_sink, app_id=self.app_id)
         for name, factory in (modes or {}).items():
             self.mode_router.register_mode(name, factory)
 
+        self.focus_manager = FocusManager(
+            can_enter_focus=lambda cid: self.mode_router.capabilities(cid).allow_sub_focus,
+            on_focus_change=self._sync_focus_index,
+            on_capability_denied=self._emit_capability_denied,
+        )
+        for domain in focus_domains:
+            self.focus_manager.register(domain)
+
+        self.registry = FunctionRegistry(list(tools))
         self.rhythm = RhythmStateStore(seed=self.seed)
         self.bio_clock: TimeCurve = bio_clock or ConstantClock(1.0)
         self.decision_engine = DecisionEngine(
@@ -111,12 +116,10 @@ class FrostApp:
             focus_manager=self.focus_manager,
             history=self.seed.history,
             seed=self.seed,
-            pruner=self.pruner,
+            pruner=None,
             event_sink=self.event_sink,
             app_id=self.app_id,
         )
-
-        self._lock_map: dict[str, asyncio.Lock] = {}
 
         def _lock_for(cid: str) -> asyncio.Lock:
             return self.pipeline.lock_for(cid)
@@ -129,6 +132,7 @@ class FrostApp:
                 summarizer=summarizer,
                 lock_for_chat=_lock_for,
                 is_chat_focused=self.focus_manager.is_focused,
+                can_trigger_diary=lambda cid: self.mode_router.capabilities(cid).triggers_diary,
                 min_dialogue_turns=diary_min_turns,
                 keep_last_turns=diary_keep_last,
                 event_sink=self.event_sink,
@@ -146,6 +150,8 @@ class FrostApp:
             mode_router=self.mode_router,
             recall_pipeline=self.recall_pipeline,
             send_callback=self._send_to_adapter,
+            focus_manager=self.focus_manager,
+            pruner=self.pruner,
             policy_resolver=policy_resolver,
             inbound_middlewares=inbound_middlewares,
             outbound_middlewares=outbound_middlewares,
@@ -163,7 +169,36 @@ class FrostApp:
         self._adapter_tasks: list[asyncio.Task[None]] = []
         self._stop_event = asyncio.Event()
 
+    def _emit_capability_denied(self, chat_id: str, capability: str) -> None:
+        self.event_sink.emit(
+            StructuredEvent(
+                app_id=self.app_id,
+                kind="mode.capability_denied",
+                chat_id=chat_id,
+                payload={
+                    "capability": capability,
+                    "mode": self.mode_router.current_mode(chat_id),
+                },
+            )
+        )
+
+    def _sync_focus_index(self, chat_id: str, domain_name: str | None) -> None:
+        if self.seed.is_closed:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.seed.set_chat_focus_domain(chat_id, domain_name)
+            return
+        task = loop.create_task(self.seed.a_set_chat_focus_domain(chat_id, domain_name))
+        self._bg_index_tasks.add(task)
+        task.add_done_callback(self._bg_index_tasks.discard)
+
     async def _send_to_adapter(self, chat_id: str, message: OutboundMessage) -> DeliveryReceipt:
+        if not self.mode_router.capabilities(chat_id).can_send:
+            self._emit_capability_denied(chat_id, "can_send")
+            return DeliveryReceipt(ok=False, error="mode_forbids_send")
+
         name = self.pipeline.preferred_adapter(chat_id)
         adapter = self.adapters.get(name)
         if adapter is None and self._adapter_order:
@@ -206,7 +241,12 @@ class FrostApp:
         if self.persona_guard is not None:
             self.persona_guard.verify(self.persona_guard.persona_text, sink=self.event_sink)
 
-        swept = self.focus_manager.sweep_orphans(self.seed.history)
+        # O(1) orphan focus sweep using SQLite chat_sessions index
+        candidate_cids = await self.seed.a_list_active_focus_chats()
+        swept = self.focus_manager.sweep_orphans(
+            self.seed.history,
+            candidate_chat_ids=candidate_cids,
+        )
         if swept:
             self.event_sink.emit(
                 StructuredEvent(
@@ -287,6 +327,10 @@ class FrostApp:
         self._lease_task = None
 
         await self.pipeline.close()
+        if self._bg_index_tasks:
+            await asyncio.gather(*list(self._bg_index_tasks), return_exceptions=True)
+            self._bg_index_tasks.clear()
+
         close_llm = getattr(self.llm, "close", None)
         if callable(close_llm):
             res = close_llm()

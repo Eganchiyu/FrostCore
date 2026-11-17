@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,8 +14,13 @@ from frostcore.focus.rewrite import (
     rewrite_in_memory_messages,
     rewrite_persistent_session,
 )
+from frostcore.observability.text import safe_truncate
 
 DEFAULT_MAX_IDLE_TURNS = 5
+
+
+class FocusForbiddenError(RuntimeError):
+    """Raised when the active chat mode forbids entering a sub-focus domain."""
 
 
 @dataclass
@@ -42,11 +48,28 @@ class FocusExit:
 class FocusManager:
     """Per-app focus state machine: at most 1 active focus domain per chat_id."""
 
-    def __init__(self, default_idle_turns: int = DEFAULT_MAX_IDLE_TURNS) -> None:
+    def __init__(
+        self,
+        default_idle_turns: int = DEFAULT_MAX_IDLE_TURNS,
+        *,
+        can_enter_focus: Callable[[str], bool] | None = None,
+        on_focus_change: Callable[[str, str | None], None] | None = None,
+        on_capability_denied: Callable[[str, str], None] | None = None,
+    ) -> None:
         self.default_idle_turns = max(1, int(default_idle_turns or DEFAULT_MAX_IDLE_TURNS))
+        self._can_enter_focus = can_enter_focus
+        self._on_focus_change = on_focus_change
+        self._on_capability_denied = on_capability_denied
         self._domains: dict[str, FocusDomain] = {}
         self._tool_to_domain: dict[str, FocusDomain] = {}
         self._states: dict[str, FocusState] = {}
+
+    def _notify_change(self, chat_id: str, domain_name: str | None) -> None:
+        if self._on_focus_change is not None:
+            try:
+                self._on_focus_change(str(chat_id), domain_name)
+            except Exception:
+                pass
 
     def register(self, domain: FocusDomain) -> FocusDomain:
         self._domains[domain.name] = domain
@@ -90,6 +113,14 @@ class FocusManager:
         history: HistoryStore | None = None,
     ) -> FocusState:
         cid = str(chat_id)
+        if self._can_enter_focus is not None and not self._can_enter_focus(cid):
+            if self._on_capability_denied is not None:
+                try:
+                    self._on_capability_denied(cid, "allow_sub_focus")
+                except Exception:
+                    pass
+            raise FocusForbiddenError(f"Active mode forbids sub-focus entry for chat {cid}")
+
         d = self.domain(domain)
         state = self._states.get(cid)
 
@@ -100,6 +131,7 @@ class FocusManager:
         if state is None:
             state = FocusState(chat_id=cid, domain=d.name, goal=goal.strip())
             self._states[cid] = state
+            self._notify_change(cid, d.name)
             if d.on_enter is not None:
                 try:
                     d.on_enter(cid, state.goal)
@@ -119,6 +151,7 @@ class FocusManager:
             return
         if domain is None or state.domain == domain:
             self._states.pop(cid, None)
+            self._notify_change(cid, None)
 
     def record_step(
         self,
@@ -143,7 +176,7 @@ class FocusManager:
         note_str = note.strip()
         entry = f"{desc} ({note_str})" if (desc and note_str) else (desc or note_str)
         if entry:
-            state.trace.append(entry[:80])
+            state.trace.append(safe_truncate(entry, 80))
             if len(state.trace) > max_trace:
                 del state.trace[:-max_trace]
 
@@ -197,6 +230,7 @@ class FocusManager:
         if d is None:
             return None
 
+        self._notify_change(cid, None)
         final_summary = self.build_fallback_summary(state, summary, domain=d.name)
 
         if history is not None:
@@ -301,7 +335,7 @@ class FocusManager:
                 segment_domain = msg_domain
                 swept_in_chat += 1
                 if msg.get("role") == "assistant" and msg.get("content"):
-                    segment_thoughts.append(str(msg["content"]).strip()[:60])
+                    segment_thoughts.append(safe_truncate(str(msg["content"]).strip(), 60))
                 elif msg.get("role") == "tool" and msg.get("name"):
                     segment_tools.append(str(msg["name"]))
             else:
@@ -319,21 +353,35 @@ class FocusManager:
 
         return new_session, swept_in_chat
 
-    def sweep_orphans(self, history: HistoryStore | None) -> int:
+    def sweep_orphans(
+        self,
+        history: HistoryStore | None,
+        *,
+        candidate_chat_ids: Sequence[str] | None = None,
+    ) -> int:
         """Collapse orphaned focus segments left over from unexpected restarts."""
         if history is None:
             return 0
+        chat_ids = (
+            list(candidate_chat_ids)
+            if candidate_chat_ids is not None
+            else history.list_chat_ids()
+        )
         total_swept = 0
-        for cid in history.list_chat_ids():
+        for cid in chat_ids:
             session = history.get_session(cid)
-            if not session:
-                continue
             active_state = self.active(cid)
             active_domain = active_state.domain if active_state else None
+            if not session:
+                if active_domain is None:
+                    self._notify_change(cid, None)
+                continue
             new_session, swept_in_chat = self._sweep_session(session, active_domain)
             if swept_in_chat > 0:
                 total_swept += swept_in_chat
                 history.replace_session(cid, new_session)
+            if active_domain is None:
+                self._notify_change(cid, None)
 
         return total_swept
 
@@ -341,6 +389,7 @@ class FocusManager:
 __all__ = [
     "DEFAULT_MAX_IDLE_TURNS",
     "FocusExit",
+    "FocusForbiddenError",
     "FocusManager",
     "FocusState",
 ]

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from frostcore.contracts.events import InboundEvent
 from frostcore.contracts.policy import ChatPolicy, DecisionContext, DecisionFactor, RecallItem
 from frostcore.rhythm.bioclock import ConstantClock, TimeCurve
-from frostcore.rhythm.state import RhythmStateStore
+from frostcore.rhythm.state import ChatRhythm, RhythmStateStore
 
 
 @dataclass(frozen=True)
@@ -44,33 +44,20 @@ class DecisionEngine:
         self.high_energy_shortcut = float(high_energy_shortcut)
         self.recall_hormone_gain = float(recall_hormone_gain)
 
-    def evaluate(
+    def _score_state(
         self,
         chat_id: str,
         events: Sequence[InboundEvent],
+        pol: ChatPolicy,
+        ts: float,
         *,
-        policy: ChatPolicy | None = None,
-        recall_items: Sequence[RecallItem] = (),
-        now: float | None = None,
+        energy: float,
+        clock_weight: float,
+        desire: float,
+        hormone: float,
+        snap: ChatRhythm,
+        recall_items: Sequence[RecallItem],
     ) -> DecisionResult:
-        pol = policy or ChatPolicy()
-        ts = time.time() if now is None else float(now)
-
-        if pol.dormant:
-            return DecisionResult(
-                should_reply=False,
-                score=0.0,
-                threshold=self.reply_threshold,
-                reason="dormant",
-            )
-
-        energy = self.rhythm.update_energy(chat_id, now=ts)
-        clock_weight = float(self.clock(ts))
-        desire = self.rhythm.compute_desire(chat_id, clock_weight, now=ts)
-        top_recall = max((item.score for item in recall_items), default=0.0)
-        hormone = self.rhythm.update_hormone(chat_id, top_recall, gain=self.recall_hormone_gain)
-        snap = self.rhythm.snapshot(chat_id, now=ts)
-
         if pol.force_reply:
             return DecisionResult(
                 should_reply=True,
@@ -128,6 +115,89 @@ class DecisionEngine:
                 "speaker_bonus": round(speaker_bonus, 2),
                 "factors": round(factor_sum, 2),
             },
+        )
+
+    def evaluate(
+        self,
+        chat_id: str,
+        events: Sequence[InboundEvent],
+        *,
+        policy: ChatPolicy | None = None,
+        recall_items: Sequence[RecallItem] = (),
+        now: float | None = None,
+    ) -> DecisionResult:
+        pol = policy or ChatPolicy()
+        ts = time.time() if now is None else float(now)
+
+        if pol.dormant:
+            return DecisionResult(
+                should_reply=False,
+                score=0.0,
+                threshold=self.reply_threshold,
+                reason="dormant",
+            )
+
+        energy = self.rhythm.update_energy(chat_id, now=ts)
+        clock_weight = float(self.clock(ts))
+        desire = self.rhythm.compute_desire(chat_id, clock_weight, now=ts)
+        top_recall = max((item.score for item in recall_items), default=0.0)
+        hormone = self.rhythm.update_hormone(chat_id, top_recall, gain=self.recall_hormone_gain)
+        snap = self.rhythm.snapshot(chat_id, now=ts)
+        return self._score_state(
+            chat_id,
+            events,
+            pol,
+            ts,
+            energy=energy,
+            clock_weight=clock_weight,
+            desire=desire,
+            hormone=hormone,
+            snap=snap,
+            recall_items=recall_items,
+        )
+
+    async def a_evaluate(
+        self,
+        chat_id: str,
+        events: Sequence[InboundEvent],
+        *,
+        policy: ChatPolicy | None = None,
+        recall_items: Sequence[RecallItem] = (),
+        now: float | None = None,
+    ) -> DecisionResult:
+        """Non-blocking async evaluation using async FrostSeed rhythm persistence."""
+        pol = policy or ChatPolicy()
+        ts = time.time() if now is None else float(now)
+
+        if pol.dormant:
+            return DecisionResult(
+                should_reply=False,
+                score=0.0,
+                threshold=self.reply_threshold,
+                reason="dormant",
+            )
+
+        energy = await self.rhythm.a_update_energy(chat_id, now=ts)
+        clock_weight = float(self.clock(ts))
+        desire = await self.rhythm.a_compute_desire(chat_id, clock_weight, now=ts)
+        top_recall = max((item.score for item in recall_items), default=0.0)
+        hormone = await self.rhythm.a_update_hormone(
+            chat_id,
+            top_recall,
+            gain=self.recall_hormone_gain,
+        )
+        snap = await self.rhythm.a_snapshot(chat_id, now=ts)
+        return self._score_state(
+            chat_id,
+            events,
+            pol,
+            ts,
+            energy=energy,
+            clock_weight=clock_weight,
+            desire=desire,
+            hormone=hormone,
+            snap=snap,
+            recall_items=recall_items,
         )
 
 

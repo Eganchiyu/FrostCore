@@ -6,6 +6,7 @@ from typing import Any
 
 from frostcore.contracts.ports import HistoryStore
 from frostcore.focus.manager import FocusManager
+from frostcore.observability.text import safe_truncate
 
 STUB_PREFIX = "[Tool History Collapsed] "
 STUB_MAX_CHARS = 220
@@ -34,7 +35,7 @@ def _format_stub(name: str, payload: dict[str, Any], focus_manager: FocusManager
 
     if note:
         text = f"{text} note:{note}".strip()
-    return f"{STUB_PREFIX}{text}"[:STUB_MAX_CHARS]
+    return safe_truncate(f"{STUB_PREFIX}{text}", STUB_MAX_CHARS)
 
 
 class ToolHistoryPruner:

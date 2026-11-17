@@ -1,4 +1,4 @@
-"""Per-chat serialized SessionPipeline with middleware chains and debounce."""
+"""Per-chat serialized SessionPipeline with middleware chains, async rhythm, and atomic commits."""
 from __future__ import annotations
 
 import asyncio
@@ -24,8 +24,11 @@ from frostcore.contracts.ports import (
 )
 from frostcore.contracts.probe import EventSink, StructuredEvent
 from frostcore.contracts.turn import TurnInput, TurnOutput
+from frostcore.focus.manager import FocusManager
+from frostcore.focus.rewrite import rewrite_persistent_session
 from frostcore.kernel.composer import format_inbound_batch
 from frostcore.kernel.evaluator import TurnEvaluator
+from frostcore.kernel.pruner import ToolHistoryPruner
 from frostcore.kernel.toolchain import SKIP_REPLY_SENTINEL
 from frostcore.memory.dialogue_filter import dialogue_length
 from frostcore.memory.diary import DiaryEngine
@@ -42,7 +45,7 @@ class _DefaultPolicyResolver:
 
 
 class SessionPipeline:
-    """Coordinates inbound middlewares, mode routing, debounce, recall, decision, F, and diary."""
+    """Coordinates middlewares, mode routing, debounce, recall, decision, F, and atomic commits."""
 
     def __init__(
         self,
@@ -56,6 +59,8 @@ class SessionPipeline:
         mode_router: ModeRouter,
         recall_pipeline: RecallPipeline,
         send_callback: Callable[[str, OutboundMessage], Awaitable[DeliveryReceipt]],
+        focus_manager: FocusManager | None = None,
+        pruner: ToolHistoryPruner | None = None,
         policy_resolver: PolicyResolver | None = None,
         inbound_middlewares: Sequence[InboundMiddleware] = (),
         outbound_middlewares: Sequence[OutboundMiddleware] = (),
@@ -75,6 +80,8 @@ class SessionPipeline:
         self.mode_router = mode_router
         self.recall_pipeline = recall_pipeline
         self._send_callback = send_callback
+        self.focus_manager = focus_manager
+        self.pruner = pruner
         self.policy_resolver: PolicyResolver = policy_resolver or _DefaultPolicyResolver()
         self.inbound_middlewares = list(inbound_middlewares)
         self.outbound_middlewares = list(outbound_middlewares)
@@ -194,6 +201,40 @@ class SessionPipeline:
         self._debounce_tasks[cid] = task
         self._inflight_tasks.add(task)
 
+    def _commit_turn_history(
+        self,
+        cid: str,
+        *,
+        batch_text: str,
+        only_system: bool,
+        entity_ids: list[str],
+        turn_output: TurnOutput,
+    ) -> None:
+        if batch_text:
+            extra_msg: dict[str, Any] = {}
+            if only_system:
+                extra_msg["is_system_injected"] = True
+            if entity_ids:
+                extra_msg["entity_id"] = entity_ids[0]
+            self.history.append_message(cid, "user", batch_text, **extra_msg)
+
+        if turn_output.outcome in ("skip", "error"):
+            return
+
+        if turn_output.focus_exits and self.focus_manager is not None:
+            for exit_rec in turn_output.focus_exits:
+                domain = self.focus_manager.get_domain(exit_rec.domain)
+                if domain is not None:
+                    session = self.history.get_session(cid)
+                    rewritten = rewrite_persistent_session(session, domain, exit_rec.summary)
+                    self.history.replace_session(cid, rewritten)
+
+        for msg in turn_output.persist_messages:
+            role = str(msg.get("role") or "assistant")
+            content = msg.get("content")
+            extra = {k: v for k, v in msg.items() if k not in ("role", "content")}
+            self.history.append_message(cid, role, content, **extra)
+
     async def _run_chat_turn(self, chat_id: str) -> None:
         cid = str(chat_id)
         async with self.lock_for(cid):
@@ -209,7 +250,7 @@ class SessionPipeline:
             now = float(self._now_fn())
             for ev in events:
                 if isinstance(ev, IncomingEvent) and not ev.is_bot:
-                    self.rhythm.boost_activity(cid, now=now)
+                    await self.rhythm.a_boost_activity(cid, now=now)
 
             entity_ids = [
                 ev.sender.entity_id
@@ -232,7 +273,7 @@ class SessionPipeline:
             ):
                 policy = policy.model_copy(update={"force_reply": True})
 
-            decision = self.decision_engine.evaluate(
+            decision = await self.decision_engine.a_evaluate(
                 cid,
                 events,
                 policy=policy,
@@ -249,15 +290,18 @@ class SessionPipeline:
                 },
             )
 
+            caps = self.mode_router.capabilities(cid)
+            can_write_history = caps.writes_chat_history
             batch_text = format_inbound_batch(events)
             only_system = all(ev.is_system_injected for ev in events)
+
             if not decision.should_reply:
-                if batch_text and not only_system:
+                if batch_text and not only_system and can_write_history:
                     self.history.append_message(cid, "user", batch_text)
                 return
 
             session = self.history.get_session(cid)
-            snap = self.rhythm.snapshot(cid, now=now)
+            snap = await self.rhythm.a_snapshot(cid, now=now)
             clock_weight = float(self.decision_engine.clock(now))
             composed = await self.prompt_composer.compose(
                 ComposeContext(
@@ -273,15 +317,11 @@ class SessionPipeline:
             )
 
             if self.persona_guard is not None:
-                self.persona_guard.verify(composed.system_prompt, sink=self.event_sink)
-
-            if batch_text:
-                extra_msg: dict[str, Any] = {}
-                if only_system:
-                    extra_msg["is_system_injected"] = True
-                if entity_ids:
-                    extra_msg["entity_id"] = entity_ids[0]
-                self.history.append_message(cid, "user", batch_text, **extra_msg)
+                self.persona_guard.verify_composed(
+                    composed.system_prompt,
+                    persona_block=composed.persona_block,
+                    sink=self.event_sink,
+                )
 
             self._turn_seq += 1
             turn_input = TurnInput(
@@ -297,11 +337,41 @@ class SessionPipeline:
             )
             turn_output = await self.evaluator.evaluate(turn_input)
 
+            # Re-read mode capabilities after turn evaluation in case mode transitioned
+            caps = self.mode_router.capabilities(cid)
+            can_write_history = caps.writes_chat_history
+
+            if can_write_history:
+                self._commit_turn_history(
+                    cid,
+                    batch_text=batch_text,
+                    only_system=only_system,
+                    entity_ids=entity_ids,
+                    turn_output=turn_output,
+                )
+            else:
+                self._emit(
+                    "mode.capability_denied",
+                    cid,
+                    {
+                        "capability": "writes_chat_history",
+                        "mode": self.mode_router.current_mode(cid),
+                    },
+                )
+
             if (
-                turn_output.outcome == "skip"
+                turn_output.outcome in ("skip", "error")
                 or turn_output.reply == SKIP_REPLY_SENTINEL
                 or not turn_output.reply.strip()
             ):
+                return
+
+            if not caps.can_send:
+                self._emit(
+                    "mode.capability_denied",
+                    cid,
+                    {"capability": "can_send", "mode": self.mode_router.current_mode(cid)},
+                )
                 return
 
             reply_to = events[-1].event_id if events else None
@@ -312,15 +382,25 @@ class SessionPipeline:
             )
             receipt = await self._send_through_middlewares(outbound, turn_output)
             if receipt.ok:
-                self.history.append_message(
-                    cid,
-                    "assistant",
-                    turn_output.raw_reply or turn_output.reply,
-                )
-                self.rhythm.consume_energy(cid, now=now)
+                if can_write_history:
+                    self.history.append_message(
+                        cid,
+                        "assistant",
+                        turn_output.raw_reply or turn_output.reply,
+                    )
+                await self.rhythm.a_consume_energy(cid, now=now)
+
+            if (
+                self.pruner is not None
+                and can_write_history
+                and not (self.focus_manager is not None and self.focus_manager.is_focused(cid))
+            ):
+                self.pruner.after_turn(cid, bool(turn_output.used_tools))
 
             if (
                 self.diary_engine is not None
+                and can_write_history
+                and caps.triggers_diary
                 and not only_system
                 and dialogue_length(self.history.get_session(cid))
                 >= self.diary_engine.min_dialogue_turns

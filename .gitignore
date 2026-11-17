@@ -16,3 +16,5 @@ dist/
 *.lock
 logs/
 .env
+merge.py
+merged_files.txt

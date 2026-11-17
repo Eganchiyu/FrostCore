@@ -3,6 +3,7 @@ from frostcore.focus.domain import FocusDomain
 from frostcore.focus.manager import (
     DEFAULT_MAX_IDLE_TURNS,
     FocusExit,
+    FocusForbiddenError,
     FocusManager,
     FocusState,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "DEFAULT_MAX_IDLE_TURNS",
     "FocusDomain",
     "FocusExit",
+    "FocusForbiddenError",
     "FocusManager",
     "FocusState",
     "ToolView",

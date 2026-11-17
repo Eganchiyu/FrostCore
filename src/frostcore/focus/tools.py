@@ -18,7 +18,8 @@ def focus_start_spec(
     """Create a standard entry ToolSpec bound to a specific FocusManager."""
 
     async def _default_start(context: ToolContext, goal: str = "") -> ToolResult:
-        state = manager.enter(context.chat_id, domain.name, goal=goal, history=context.history)
+        hist = None if context.metadata.get("defer_history_persist") else context.history
+        state = manager.enter(context.chat_id, domain.name, goal=goal, history=hist)
         return ToolResult(
             success=True,
             content=f"Entered {domain.title} focus mode.",
@@ -50,9 +51,10 @@ def focus_finish_spec(
     """Create a standard exit ToolSpec bound to a specific FocusManager."""
 
     async def _default_finish(context: ToolContext, summary: str = "") -> ToolResult:
+        hist = None if context.metadata.get("defer_history_persist") else context.history
         exit_ev = manager.exit(
             context.chat_id,
-            history=context.history,
+            history=hist,
             summary=summary,
             reason="finish",
             domain=domain.name,

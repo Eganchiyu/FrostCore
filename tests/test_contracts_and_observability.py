@@ -24,6 +24,7 @@ from frostcore.observability import (
     PersonaTamperedError,
     ReadOnlyPersonaSnapshot,
     is_dry_run,
+    safe_truncate,
 )
 
 
@@ -143,8 +144,21 @@ def test_health_probe_aggregates_multi_bot_and_dry_run(monkeypatch) -> None:
 
 def test_read_only_persona_guard() -> None:
     sink = MemoryEventSink()
-    snap = ReadOnlyPersonaSnapshot.from_text("bot-1", "You are Yuki.")
-    snap.verify("You are Yuki.", sink=sink)
+    snap = ReadOnlyPersonaSnapshot.from_text("bot-1", "You are Frost.")
+    snap.verify("You are Frost.", sink=sink)
+    assert sink.events() == []
+
+    # Dynamic memory/time slots must NOT cause false positives in verify_composed
+    snap.verify_composed(
+        "You are Frost.\n\nRelevant past memories:\n- met Alice",
+        persona_block="You are Frost.",
+        sink=sink,
+    )
+    snap.verify_composed(
+        "[2026-11-17] You are Frost.\n\nContext...",
+        persona_block=None,
+        sink=sink,
+    )
     assert sink.events() == []
 
     try:
@@ -153,4 +167,21 @@ def test_read_only_persona_guard() -> None:
     except PersonaTamperedError:
         pass
 
-    assert len(sink.events(kind="persona.tampered")) == 1
+    try:
+        snap.verify_composed("Completely replaced prompt", persona_block=None, sink=sink)
+        raise AssertionError("Expected PersonaTamperedError on missing anchor")
+    except PersonaTamperedError:
+        pass
+
+    assert len(sink.events(kind="persona.tampered")) == 2
+
+
+def test_safe_truncate_preserves_zwj_emoji_and_combining_clusters() -> None:
+    family = "Hi 👨‍👩‍👧‍👦!"
+    # Cutting inside the family ZWJ sequence must step back before the cluster
+    assert safe_truncate(family, 6) == "Hi "
+    assert safe_truncate(family, len(family)) == family
+
+    accented = "cafe\u0301 test"
+    assert safe_truncate(accented, 4) == "caf"
+    assert safe_truncate("hello", 0) == ""

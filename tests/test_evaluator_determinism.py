@@ -1,6 +1,7 @@
 """Tests for deterministic F(TurnInput) -> TurnOutput evaluation and tool loop."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from frostcore.contracts import LLMResponse, TurnInput
@@ -148,3 +149,54 @@ async def test_turn_evaluator_exhausted_and_text_tool_fallback() -> None:
     assert out.outcome == "exhausted"
     assert out.used_tools == ("echo",)
     assert out.reply == "fallback summary after exhaustion"
+
+
+async def test_concurrent_safe_tools_execute_in_parallel() -> None:
+    arrived = 0
+    both_entered = asyncio.Event()
+
+    async def _parallel_tool(ctx: ToolContext, label: str) -> ToolResult:
+        nonlocal arrived
+        arrived += 1
+        if arrived == 2:
+            both_entered.set()
+        # Deadlocks if executed sequentially
+        await asyncio.wait_for(both_entered.wait(), timeout=1.0)
+        return ToolResult(success=True, content=f"done:{label}")
+
+    reg = FunctionRegistry(
+        [
+            ToolSpec(
+                name="lookup",
+                description="Safe read-only lookup",
+                parameters={"type": "object", "properties": {"label": {"type": "string"}}},
+                handler=_parallel_tool,
+                concurrent_safe=True,
+            )
+        ]
+    )
+    llm = FakeLLMClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"label":"a"}'},
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"label":"b"}'},
+                    },
+                ],
+            ),
+            LLMResponse(content="both done"),
+        ]
+    )
+    ev = TurnEvaluator(llm=llm, registry=reg)
+    out = await ev.evaluate(TurnInput(chat_id="c1", messages=[{"role": "user", "content": "go"}]))
+    assert out.outcome == "reply"
+    assert out.reply == "both done"
+    assert out.used_tools == ("lookup", "lookup")

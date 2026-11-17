@@ -9,7 +9,7 @@ from frostcore.contracts.ports import HistoryStore
 from frostcore.contracts.probe import EventSink, StructuredEvent
 from frostcore.contracts.turn import PersistDecision, TurnOutcome
 from frostcore.focus.manager import FocusExit, FocusManager
-from frostcore.focus.rewrite import rewrite_in_memory_messages
+from frostcore.focus.rewrite import is_domain_work_message, rewrite_in_memory_messages
 from frostcore.kernel.pruner import ToolHistoryPruner
 from frostcore.kernel.toolchain import FunctionRegistry, ToolCallManager, ToolContext
 
@@ -34,7 +34,9 @@ class TurnState:
     exited_this_turn: set[str] = field(default_factory=set)
     exited_order: list[str] = field(default_factory=list)
     pending_exits: list[FocusExit] = field(default_factory=list)
+    completed_exits: list[FocusExit] = field(default_factory=list)
     batch_exited_domains: set[str] = field(default_factory=set)
+    persist_messages: list[dict[str, Any]] = field(default_factory=list)
     tool_trace: list[dict[str, Any]] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
     sent_thoughts: set[str] = field(default_factory=set)
@@ -215,9 +217,13 @@ class FocusHook(BaseTurnHook):
             st.exited_this_turn.add(exit_item.domain)
             if exit_item.domain not in st.exited_order:
                 st.exited_order.append(exit_item.domain)
+            st.completed_exits.append(exit_item)
             d_obj = self.manager.get_domain(exit_item.domain)
             if d_obj is not None:
                 rewrite_in_memory_messages(st.tool_messages, d_obj, exit_item.summary)
+                st.persist_messages = [
+                    m for m in st.persist_messages if not is_domain_work_message(m, d_obj)
+                ]
             if self.restore_rounds_on_exit and not self.manager.is_focused(st.chat_id):
                 st.max_rounds = max(st.round_idx + 1, st.base_max_rounds)
         st.batch_exited_domains.clear()
@@ -225,13 +231,21 @@ class FocusHook(BaseTurnHook):
 
     def on_turn_end(self, st: TurnState) -> None:
         try:
+            # Never mutate HistoryStore directly inside F; defer idle-exit commit to SessionPipeline
             exit_ev = self.manager.after_turn(
                 st.chat_id,
                 st.used_domains,
-                history=self.history,
+                history=None,
             )
-            if exit_ev is not None and exit_ev.domain not in st.exited_order:
-                st.exited_order.append(exit_ev.domain)
+            if exit_ev is not None:
+                if exit_ev.domain not in st.exited_order:
+                    st.exited_order.append(exit_ev.domain)
+                st.completed_exits.append(exit_ev)
+                d_obj = self.manager.get_domain(exit_ev.domain)
+                if d_obj is not None:
+                    st.persist_messages = [
+                        m for m in st.persist_messages if not is_domain_work_message(m, d_obj)
+                    ]
         except Exception:
             pass
 

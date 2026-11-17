@@ -134,6 +134,7 @@ class ComposedPrompt(BaseModel):
     """Final prompt structure produced by PromptComposer."""
 
     system_prompt: str
+    persona_block: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
 

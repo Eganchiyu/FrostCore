@@ -54,7 +54,11 @@ class SimplePromptComposer:
         if batch_text:
             messages.append({"role": "user", "content": batch_text})
 
-        return ComposedPrompt(system_prompt=system_prompt, messages=messages)
+        return ComposedPrompt(
+            system_prompt=system_prompt,
+            persona_block=self.persona,
+            messages=messages,
+        )
 
 
 __all__ = ["SimplePromptComposer", "format_inbound_batch"]

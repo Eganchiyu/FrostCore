@@ -29,7 +29,7 @@ class ModeCapabilities:
         }
 
 
-CHAT_CAPABILITIES = ModeCapabilities()
+CHAT_CAPABILITIES = ModeCapabilities(allow_sub_focus=True)
 
 
 class Mode:

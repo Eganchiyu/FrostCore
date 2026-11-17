@@ -12,6 +12,8 @@ from frostcore import (
     CLIAdapter,
     DeliveryReceipt,
     EntityRef,
+    FocusDomain,
+    FocusForbiddenError,
     FrostApp,
     FrostSeed,
     HealthProbeServer,
@@ -21,6 +23,7 @@ from frostcore import (
     Mode,
     ModeCapabilities,
     OutboundMessage,
+    ReadOnlyPersonaSnapshot,
     TurnOutput,
 )
 from frostcore.testing import (
@@ -205,3 +208,80 @@ async def test_frostapp_dry_run_skips_adapters_and_marks_probe_ready(
             assert len(sink.events(kind="app.dry_run_ready")) == 1
     finally:
         probe.stop()
+
+
+async def test_persona_guard_with_memories_and_mode_capabilities_enforced(tmp_path: Path) -> None:
+    persona = "You are Frost, gentle and consistent."
+    sink = MemoryEventSink()
+    adapter = MemoryChannelAdapter("cap")
+    domain = FocusDomain(
+        name="art",
+        title="Art",
+        entry_tool="art_start",
+        exit_tool="art_finish",
+        domain_tools=frozenset({"art_draw"}),
+    )
+
+    with FrostSeed(tmp_path / "caps.seed") as seed:
+        seed.append_diary(chat_id="c1", content="Alice loves green tea ice cream.")
+        app = FrostApp(
+            app_id="cap-bot",
+            seed=seed,
+            llm=FakeLLMClient(
+                [
+                    LLMResponse(content="Remembered!"),
+                    LLMResponse(content="Should not send or persist"),
+                ]
+            ),
+            adapters=[adapter],
+            persona=persona,
+            persona_guard=ReadOnlyPersonaSnapshot.from_text("cap-bot", persona),
+            focus_domains=[domain],
+            diary_summarizer=FakeDiarySummarizer("D:"),
+            diary_min_turns=1,
+            event_sink=sink,
+            close_seed_on_stop=False,
+        )
+
+        async with app:
+            # 1. With recalled diary memory injected, persona_guard must NOT false-positive
+            await adapter.inject(
+                IncomingEvent(
+                    chat_id="c1",
+                    sender=EntityRef(entity_id="u1", display_name="Alice"),
+                    content="green tea ice cream",
+                )
+            )
+            await app.pipeline.drain()
+            assert [m.text for m in adapter.sent_messages] == ["Remembered!"]
+
+            # 2. Enter restrictive non-chat mode and verify all 4 capability gates enforce
+            restrictive = _QuietMode(chat_id="c1")
+            app.mode_router.enter("c1", "quiet", instance=restrictive)
+
+            # 2a) allow_sub_focus=False blocks FocusManager.enter
+            try:
+                app.focus_manager.enter("c1", "art", goal="forbidden")
+                raise AssertionError("Expected FocusForbiddenError")
+            except FocusForbiddenError:
+                pass
+
+            # 2b) can_send=False blocks _send_to_adapter
+            receipt = await app._send_to_adapter(
+                "c1",
+                OutboundMessage(chat_id="c1", text="forbidden"),
+            )
+            assert receipt.ok is False
+            assert receipt.error == "mode_forbids_send"
+
+            # 2c) triggers_diary=False blocks DiaryEngine.consolidate
+            assert app.diary_engine is not None
+            assert await app.diary_engine.consolidate("c1", force=True) is None
+
+            # 2d) writes_chat_history=False blocks SessionPipeline history mutation
+            before_len = len(seed.history.get_session("c1"))
+            await app.pipeline._run_chat_turn("c1")
+            assert len(seed.history.get_session("c1")) == before_len
+
+            denied = [e.payload["capability"] for e in sink.events(kind="mode.capability_denied")]
+            assert {"allow_sub_focus", "can_send", "triggers_diary"}.issubset(set(denied))

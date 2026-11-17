@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from frostcore.contracts.probe import EventSink, StructuredEvent
+from frostcore.observability.text import safe_truncate
 
 _SENSITIVE_KEYS = (
     "api_key",
@@ -33,7 +34,7 @@ def redact_value(value: Any, *, key_hint: str = "") -> Any:
         if value.startswith("data:image/"):
             return "<image_omitted>"
         if len(value) > 4096:
-            return value[:4096] + "...<truncated>"
+            return safe_truncate(value, 4110, suffix="...<truncated>")
         return value
 
     if isinstance(value, dict):

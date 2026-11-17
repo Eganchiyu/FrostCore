@@ -29,6 +29,17 @@ class FocusDelta(BaseModel):
     active_after: str | None = None
 
 
+class FocusExitRecord(BaseModel):
+    """Structured record of a focus exit produced by pure turn evaluation F."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chat_id: str
+    domain: str
+    summary: str
+    reason: str = "finish"
+
+
 class TurnInput(BaseModel):
     """Explicit input boundary for deterministic turn evaluation F."""
 
@@ -49,6 +60,8 @@ class TurnOutput(BaseModel):
     reply: str
     raw_reply: str
     turn_messages: list[dict[str, Any]] = Field(default_factory=list)
+    persist_messages: list[dict[str, Any]] = Field(default_factory=list)
+    focus_exits: tuple[FocusExitRecord, ...] = ()
     tool_trace: list[dict[str, Any]] = Field(default_factory=list)
     focus_delta: FocusDelta = Field(default_factory=FocusDelta)
     used_tools: tuple[str, ...] = ()
@@ -58,6 +71,7 @@ class TurnOutput(BaseModel):
 
 __all__ = [
     "FocusDelta",
+    "FocusExitRecord",
     "PersistDecision",
     "TurnInput",
     "TurnOutcome",
