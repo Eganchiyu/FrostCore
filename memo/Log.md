@@ -13,3 +13,10 @@
 - 完成 `frostcore.modes`：`Mode`、`ModeCapabilities` 与可实例化 `ModeRouter`。
 - 完成 `frostcore.kernel`（M1 部分）：`Toolchain`、`TurnHookChain`、`ToolHistoryPruner` 与确定性 `TurnEvaluator`（`F(TurnInput) -> TurnOutput`）。
 - 完成 `frostcore.testing` 离线契约测试套件，23 项测试全部通过，`mypy --strict` 与 `ruff` 零警告。
+
+### M2 · 生物钟、纯 Python LLM、SessionPipeline、多 Bot 装配与 Quickstart/部署模板
+- 完成 `frostcore.rhythm`：`ConstantClock(1.0)` 默认常数曲线、可选 `GaussianClockPreset` 昼夜峰曲线、`RhythmStateStore`（持久化进 `FrostSeed.rhythm_snapshots`）与策略驱动 `DecisionEngine`。
+- 完成 `frostcore.llm`：基于 `aiohttp` 的实例隔离 `OpenAICompatLLMClient`（独占会话与主备熔断状态，无模块级单例）及 `LLMDiarySummarizer`。
+- 完成 `frostcore.kernel`（M2 部分）：`SimplePromptComposer`、全异步串联 `SessionPipeline`（入站/出站中间件链、`ModeRouter` 分流、防抖汇聚、per-chat 串行锁与 `drain()`）、显式 DI 容器 `FrostApp`（支持单进程多 Bot、`DRY_RUN` 与 `/health` 聚合）。
+- 完成 `frostcore.adapters.CLIAdapter`、示例 `examples/01~03` 与只读容器部署模板 `examples/deploy/`。
+- 全套 34 项离线测试、`compileall`、`mypy --strict`（46 个源文件）与 `ruff` 全部通过。

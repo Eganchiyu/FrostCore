@@ -1,0 +1,22 @@
+services:
+  frostbot:
+    build:
+      context: ../..
+      dockerfile: examples/deploy/Dockerfile
+    container_name: frostcore-bot
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # Code mounted read-only; only the portable FrostSeed directory is writable
+      - ../../src:/app/src:ro
+      - ../../examples:/app/examples:ro
+      - ./bot.seed:/data/bot.seed:rw
+    environment:
+      FROSTCORE_SEED_DIR: /data/bot.seed
+      FROSTCORE_BASE_URL: ${FROSTCORE_BASE_URL:-https://api.openai.com/v1}
+      FROSTCORE_API_KEY: ${FROSTCORE_API_KEY:-}
+      FROSTCORE_MODEL: ${FROSTCORE_MODEL:-gpt-4o-mini}
+    ports:
+      - "127.0.0.1:8778:8778"

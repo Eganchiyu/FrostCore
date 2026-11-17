@@ -45,7 +45,7 @@ async def main() -> None:
         prompt_composer=SimplePromptComposer("你是一个温柔、有自己生活节奏的伙伴。"),
     )
     async with app:
-        await app.run_forever()
+        await app.run_until_stopped()
 
 if __name__ == "__main__":
     asyncio.run(main())
